@@ -1,6 +1,7 @@
 import contextvars
 import inspect
 import logging
+import sys
 from contextlib import asynccontextmanager
 from dataclasses import asdict, is_dataclass
 from typing import Any
@@ -14,10 +15,11 @@ from mlflow.utils.autologging_utils.config import AutoLoggingConfig
 
 _logger = logging.getLogger(__name__)
 
-# Context variable to track when we're inside run_stream_sync to prevent
-# double span creation (run_stream_sync internally calls run_stream)
-_in_sync_stream_context: contextvars.ContextVar[bool] = contextvars.ContextVar(
-    "_in_sync_stream_context", default=False
+# Pydantic AI 1.x leaves the async generator behind run_stream_sync suspended, so its
+# nested Agent.run_stream span cannot close naturally. Preserve the legacy single-agent-span
+# behavior for 1.x; Pydantic AI 2.x exposes a proper result context manager instead.
+_in_legacy_sync_stream_context: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "_in_legacy_sync_stream_context", default=False
 )
 _SAFE_PRIMITIVE_TYPES = (str, int, float, bool)
 
@@ -254,18 +256,9 @@ def patched_async_stream_call(original, self, *args, **kwargs):
                 yield result
             return
 
-        # Skip span creation ONLY for Agent.run_stream when inside run_stream_sync.
-        # Agent.run_stream_sync already creates a root span, so we don't need another
-        # Agent.run_stream span. But we DO still want the nested model-level LLM span,
-        # which is created regardless of this skip: from InstrumentedModel.request_stream
-        # on pydantic-ai < 1.95, or from the Instrumentation.wrap_model_request capability
-        # hook on >= 1.95 (see patched_capability_model_request).
-        # The async context manager for Agent.run_stream won't properly exit when
-        # called from run_stream_sync (pydantic_ai's implementation uses a generator
-        # that pauses), so we skip it to avoid orphaned spans.
         from pydantic_ai import Agent
 
-        if _in_sync_stream_context.get() and isinstance(self, Agent):
+        if _in_legacy_sync_stream_context.get() and isinstance(self, Agent):
             async with original(self, *args, **kwargs) as result:
                 yield result
             return
@@ -294,10 +287,6 @@ def patched_async_stream_call(original, self, *args, **kwargs):
     return _wrapper()
 
 
-# Wrapper that captures span outputs after stream is consumed.
-# This is necessary because run_stream_sync is NOT a context manager
-# (unlike run_stream which is @asynccontextmanager). We must intercept
-# iterator completion to know when streaming finishes.
 class _StreamedRunResultSyncWrapper:
     def __init__(self, result, span):
         self._result = result
@@ -309,44 +298,42 @@ class _StreamedRunResultSyncWrapper:
         return with_active_span(self._span)
 
     def _close_result(self, exc_type=None, exc_val=None, exc_tb=None):
-        if self._closed or not hasattr(self._result, "__exit__"):
+        if self._closed:
             return None
         self._closed = True
+        if not hasattr(self._result, "__exit__"):
+            # Pydantic AI 1.x has no public sync-stream cleanup API. Retain the legacy
+            # fallback there, but let 2.x close its public result context manager normally.
+            self._end_unfinished_child_spans()
+            return None
         with self._use_span_context():
             return self._result.__exit__(exc_type, exc_val, exc_tb)
 
+    def _end_span(self, exception: BaseException | None = None):
+        try:
+            self._span.set_outputs(_serialize_output(self._result))
+            if usage_dict := _parse_usage(self._result):
+                self._span.set_attribute(SpanAttributeKey.CHAT_USAGE, usage_dict)
+        except Exception as e:
+            _logger.debug("Failed to set streaming outputs: %s", e)
+
+        if isinstance(exception, Exception):
+            self._span.record_exception(exception)
+        self._span.end(status="ERROR" if exception is not None else None)
+
     def _finalize(self, exc_type=None, exc_val=None, exc_tb=None):
         if self._finalized:
-            return
+            return None
         self._finalized = True
-        has_error = exc_type is not None
 
         try:
-            # pydantic-ai 2.x returns a context manager from run_stream_sync. Close it before
-            # ending MLflow spans so the underlying async generator and its LLM span can finish.
             suppress_exception = self._close_result(exc_type, exc_val, exc_tb)
-
-            # End child spans that haven't been ended yet.
-            # This is necessary because pydantic_ai's run_stream_sync uses an async generator
-            # that pauses mid-execution, causing async context managers (and their spans) to
-            # never properly exit. We manually end these spans before ending the root span.
-            self._end_unfinished_child_spans()
-
-            try:
-                self._span.set_outputs(_serialize_output(self._result))
-                if usage_dict := _parse_usage(self._result):
-                    self._span.set_attribute(SpanAttributeKey.CHAT_USAGE, usage_dict)
-            except Exception as e:
-                _logger.debug(f"Failed to set streaming outputs: {e}")
-            return suppress_exception
-        except Exception:
-            has_error = True
+        except BaseException as cleanup_error:
+            self._end_span(cleanup_error)
             raise
-        finally:
-            if has_error:
-                self._span.end(status="ERROR")
-            else:
-                self._span.end()
+        else:
+            self._end_span(exc_val)
+            return suppress_exception
 
     def _end_unfinished_child_spans(self):
         from mlflow.tracing.trace_manager import InMemoryTraceManager
@@ -374,11 +361,14 @@ class _StreamedRunResultSyncWrapper:
                         _logger.debug(f"Failed to end child span {span.name}: {e}")
 
     def _wrap_iterator(self, iterator_func, **kwargs):
-        with self._use_span_context():
-            try:
+        try:
+            with self._use_span_context():
                 yield from iterator_func(**kwargs)
-            finally:
-                self._finalize()
+        except BaseException:
+            self._finalize(*sys.exc_info())
+            raise
+        else:
+            self._finalize()
 
     def stream_text(self, **kwargs):
         return self._wrap_iterator(self._result.stream_text, **kwargs)
@@ -386,14 +376,21 @@ class _StreamedRunResultSyncWrapper:
     def stream_output(self, **kwargs):
         return self._wrap_iterator(self._result.stream_output, **kwargs)
 
+    def stream_response(self, **kwargs):
+        return self._wrap_iterator(self._result.stream_response, **kwargs)
+
     def stream_responses(self, **kwargs):
         return self._wrap_iterator(self._result.stream_responses, **kwargs)
 
     def get_output(self, **kwargs):
-        with self._use_span_context():
-            try:
+        try:
+            with self._use_span_context():
                 return self._result.get_output(**kwargs)
-            finally:
+        except BaseException:
+            self._finalize(*sys.exc_info())
+            raise
+        finally:
+            if not self._finalized:
                 self._finalize()
 
     def __enter__(self):
@@ -428,18 +425,23 @@ def patched_sync_stream_call(original, self, *args, **kwargs):
         # Use use_span to set this span as the active context so child spans
         # (e.g., LLM calls via InstrumentedModel) are properly parented.
         # end_on_exit=False ensures we control when the span ends (in _finalize).
-        # Also set _in_sync_stream_context to prevent patched_async_stream_call
-        # from creating another Agent.run_stream span (it would never end due to
-        # pydantic_ai's async generator implementation).
-        token = _in_sync_stream_context.set(True)
-        try:
+        from mlflow.pydantic_ai import _get_pydantic_ai_version
+
+        version = _get_pydantic_ai_version()
+        if version is not None and version.major >= 2:
             with with_active_span(span):
                 result = original(self, *args, **kwargs)
-        finally:
-            _in_sync_stream_context.reset(token)
-
+        else:
+            token = _in_legacy_sync_stream_context.set(True)
+            try:
+                with with_active_span(span):
+                    result = original(self, *args, **kwargs)
+            finally:
+                _in_legacy_sync_stream_context.reset(token)
         return _StreamedRunResultSyncWrapper(result, span)
-    except Exception:
+    except BaseException as e:
+        if isinstance(e, Exception):
+            span.record_exception(e)
         span.end(status="ERROR")
         raise
 

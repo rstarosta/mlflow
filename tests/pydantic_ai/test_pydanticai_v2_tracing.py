@@ -13,7 +13,7 @@ from pydantic_ai.models.test import TestModel
 
 import mlflow
 from mlflow.entities import SpanType
-from mlflow.pydantic_ai.autolog import _get_span_type
+from mlflow.pydantic_ai.autolog import _get_span_type, _StreamedRunResultSyncWrapper
 from mlflow.tracing.constant import SpanAttributeKey
 
 from tests.tracing.helper import get_traces
@@ -162,16 +162,52 @@ async def test_agent_run_stream_creates_agent_and_llm_spans():
     assert llm_span.parent_id == agent_span.span_id
 
 
-def test_agent_run_stream_sync_creates_agent_and_llm_spans():
+@pytest.mark.parametrize(
+    "completion_method",
+    ["stream_text", "stream_output", "stream_response", "get_output"],
+)
+@pytest.mark.parametrize("use_context_manager", [True, False])
+def test_agent_run_stream_sync_lifecycle(completion_method, use_context_manager):
     mlflow.pydantic_ai.autolog(log_traces=True)
-    agent = Agent(TestModel())
+    agent = Agent(TestModel(custom_output_text="hello"))
 
-    with agent.run_stream_sync("hello") as result:
-        assert "".join(result.stream_text()) == "success (no tool calls)"
+    result = agent.run_stream_sync("hello")
 
+    def consume():
+        value = getattr(result, completion_method)()
+        return value if completion_method == "get_output" else list(value)
+
+    if use_context_manager:
+        with result:
+            output = consume()
+    else:
+        output = consume()
+
+    assert output
     spans = get_traces()[0].data.spans
     root = _span_by_name(spans, "Agent.run_stream_sync")
+    nested_agent = _span_by_name(spans, "Agent.run_stream")
     llm = _span_by_name(spans, "TestModel.request")
     assert root.span_type == SpanType.AGENT
+    assert nested_agent.parent_id == root.span_id
     assert llm.span_type == SpanType.LLM
-    assert llm.parent_id == root.span_id
+    assert llm.parent_id == nested_agent.span_id
+
+
+def test_agent_run_stream_sync_cleanup_error_is_propagated_and_traced():
+    class FailingResult:
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            raise RuntimeError("cleanup failed")
+
+    span = mlflow.start_span_no_context(
+        name="Agent.run_stream_sync",
+        span_type=SpanType.AGENT,
+    )
+    result = _StreamedRunResultSyncWrapper(FailingResult(), span)
+
+    with pytest.raises(RuntimeError, match="cleanup failed"):
+        result.__exit__(None, None, None)
+
+    recorded_span = get_traces()[0].data.spans[0]
+    assert recorded_span.status.status_code == "ERROR"
+    assert recorded_span.events[0].attributes["exception.message"] == "cleanup failed"
