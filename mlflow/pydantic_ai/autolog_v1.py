@@ -1,16 +1,30 @@
+"""Autologging implementation for Pydantic AI 1.x."""
+
 import contextvars
+import functools
 import inspect
 import logging
+import typing
 from contextlib import asynccontextmanager
-from dataclasses import asdict, is_dataclass
-from typing import Any
 
 import mlflow
 from mlflow.entities import SpanType
 from mlflow.entities.span import LiveSpan
-from mlflow.tracing.constant import SpanAttributeKey, TokenUsageKey
+from mlflow.pydantic_ai.utils import (
+    _construct_full_inputs,
+    _get_agent_attributes,
+    _get_model_attributes,
+    _get_tool_attributes,
+    _get_toolset_attributes,
+    _model_request_inputs,
+    _parse_usage,
+    _serialize_output,
+)
+from mlflow.tracing.constant import SpanAttributeKey
 from mlflow.tracing.provider import with_active_span
+from mlflow.utils.autologging_utils import safe_patch
 from mlflow.utils.autologging_utils.config import AutoLoggingConfig
+from mlflow.utils.autologging_utils.safety import _store_patch, _wrap_patch
 
 _logger = logging.getLogger(__name__)
 
@@ -19,57 +33,6 @@ _logger = logging.getLogger(__name__)
 _in_sync_stream_context: contextvars.ContextVar[bool] = contextvars.ContextVar(
     "_in_sync_stream_context", default=False
 )
-_SAFE_PRIMITIVE_TYPES = (str, int, float, bool)
-
-
-def _is_safe_for_serialization(value: Any) -> bool:
-    if value is None:
-        return False
-    if isinstance(value, _SAFE_PRIMITIVE_TYPES):
-        return True
-    if isinstance(value, dict):
-        return all(_is_safe_for_serialization(v) for v in value.values())
-    if isinstance(value, (list, tuple)):
-        return all(_is_safe_for_serialization(v) for v in value)
-    if is_dataclass(value) and not isinstance(value, type):
-        return True
-    if isinstance(value, type):
-        return True
-    return False
-
-
-def _safe_get_attribute(instance: Any, key: str) -> Any:
-    try:
-        value = getattr(instance, key, None)
-        if value is None:
-            return None
-        if isinstance(value, type):
-            return value.__name__
-        if _is_safe_for_serialization(value):
-            return value
-        return None
-    except Exception:
-        return None
-
-
-def _extract_safe_attributes(instance: Any) -> dict[str, Any]:
-    """Extract all public attributes that are safe for serialization.
-
-    Skips attributes starting with underscore to avoid capturing internal
-    references (e.g., httpx clients) that can interfere with async cleanup.
-    """
-    attrs = {}
-    for key in dir(instance):
-        if key.startswith("_"):
-            continue
-        value = getattr(instance, key, None)
-        # Skip methods/functions, but keep types (e.g., output_type=str)
-        if callable(value) and not isinstance(value, type):
-            continue
-        safe_value = _safe_get_attribute(instance, key)
-        if safe_value is not None:
-            attrs[key] = safe_value
-    return attrs
 
 
 def _set_span_attributes(span: LiveSpan, instance):
@@ -78,7 +41,7 @@ def _set_span_attributes(span: LiveSpan, instance):
         from pydantic_ai.mcp import MCPServer
 
         if isinstance(instance, MCPServer):
-            mcp_attrs = _get_mcp_server_attributes(instance)
+            mcp_attrs = _get_toolset_attributes(instance)
             span.set_attributes({k: v for k, v in mcp_attrs.items() if v is not None})
     except Exception as e:
         _logger.warning("Failed saving MCPServer attributes: %s", e)
@@ -204,17 +167,6 @@ async def patched_capability_model_request(original, self, *args, **kwargs):
         if usage_dict := _parse_usage(result):
             span.set_attribute(SpanAttributeKey.CHAT_USAGE, usage_dict)
         return result
-
-
-def _model_request_inputs(request_context) -> dict[str, Any]:
-    if request_context is None:
-        return {}
-    inputs = {
-        "messages": getattr(request_context, "messages", None),
-        "model_settings": getattr(request_context, "model_settings", None),
-        "model_request_parameters": getattr(request_context, "model_request_parameters", None),
-    }
-    return {k: v for k, v in inputs.items() if v is not None}
 
 
 def patched_class_call(original, self, *args, **kwargs):
@@ -438,118 +390,157 @@ def _get_span_type(instance) -> str:
     return SpanType.UNKNOWN
 
 
-def _construct_full_inputs(func, *args, **kwargs) -> dict[str, Any]:
-    try:
-        sig = inspect.signature(func)
-        bound = sig.bind_partial(*args, **kwargs).arguments
-        bound.pop("self", None)
-        bound.pop("deps", None)
-
-        return {
-            k: (v.__dict__ if hasattr(v, "__dict__") else v)
-            for k, v in bound.items()
-            if v is not None
-        }
-    except (ValueError, TypeError):
-        return kwargs
-
-
-def _serialize_output(result: Any) -> Any:
-    if result is None:
-        return None
-
-    if hasattr(result, "new_messages") and callable(result.new_messages):
-        try:
-            new_messages = result.new_messages()
-            serialized_messages = [asdict(msg) for msg in new_messages]
-
-            try:
-                serialized_result = asdict(result)
-            except Exception:
-                # We can't use asdict for StreamedRunResult because its async generator
-                serialized_result = dict(result.__dict__) if hasattr(result, "__dict__") else {}
-
-            serialized_result["_new_messages_serialized"] = serialized_messages
-            return serialized_result
-        except Exception as e:
-            _logger.debug(f"Failed to serialize new_messages: {e}")
-
-    return result.__dict__ if hasattr(result, "__dict__") else result
-
-
-def _get_agent_attributes(instance):
-    attrs = {SpanAttributeKey.MESSAGE_FORMAT: "pydantic_ai"}
-    attrs.update(_extract_safe_attributes(instance))
-    if hasattr(instance, "tools"):
-        try:
-            if tools_value := _parse_tools(instance.tools):
-                attrs["tools"] = tools_value
-        except Exception:
-            pass
-    return attrs
-
-
-def _get_model_attributes(instance):
-    attrs = {SpanAttributeKey.MESSAGE_FORMAT: "pydantic_ai"}
-    attrs.update(_extract_safe_attributes(instance))
-    return attrs
-
-
-def _get_tool_attributes(instance):
-    return _extract_safe_attributes(instance)
-
-
 def _get_mcp_server_attributes(instance):
-    attrs = _extract_safe_attributes(instance)
-    if hasattr(instance, "tools"):
-        try:
-            if tools_value := _parse_tools(instance.tools):
-                attrs["tools"] = tools_value
-        except Exception:
-            pass
-    return attrs
+    return _get_toolset_attributes(instance)
 
 
-def _parse_tools(tools):
-    return [
-        {"type": "function", "function": data}
-        for tool in tools
-        if (data := tool.model_dumps(exclude_none=True))
-    ]
+def _is_async_context_manager_factory(func) -> bool:
+    wrapped = getattr(func, "__wrapped__", None)
+    return wrapped is not None and inspect.isasyncgenfunction(wrapped)
 
 
-def _parse_usage(result: Any) -> dict[str, int] | None:
+def _returns_sync_streamed_result(func) -> bool:
+    if inspect.iscoroutinefunction(func):
+        return False
+
     try:
-        if isinstance(result, tuple) and len(result) == 2:
-            usage = result[1]
-        else:
-            usage_attr = getattr(result, "usage", None)
-            if usage_attr is None:
-                return None
+        return_annotation = inspect.signature(func).return_annotation
+    except (ValueError, TypeError):
+        return False
 
-            # Handle both property (RunResult) and method (StreamedRunResult)
-            # StreamedRunResult has .usage() as a method
-            usage = usage_attr() if callable(usage_attr) else usage_attr
+    if return_annotation is inspect.Signature.empty:
+        return False
+    if isinstance(return_annotation, str):
+        return "StreamedRunResultSync" in return_annotation
 
-        if usage is None:
-            return None
+    origin = typing.get_origin(return_annotation) or return_annotation
+    return hasattr(origin, "stream_text") and hasattr(origin, "stream_output")
 
-        # input_tokens/output_tokens are the current field names; request_tokens/
-        # response_tokens are deprecated aliases kept for backward compatibility.
-        input_tokens = getattr(usage, "input_tokens", None)
-        if input_tokens is None:
-            input_tokens = getattr(usage, "request_tokens", 0)
-        output_tokens = getattr(usage, "output_tokens", None)
-        if output_tokens is None:
-            output_tokens = getattr(usage, "response_tokens", 0)
-        total_tokens = getattr(usage, "total_tokens")
-        if total_tokens is None:
-            total_tokens = input_tokens + output_tokens
-        return {
-            TokenUsageKey.INPUT_TOKENS: input_tokens,
-            TokenUsageKey.OUTPUT_TOKENS: output_tokens,
-            TokenUsageKey.TOTAL_TOKENS: total_tokens,
-        }
-    except Exception as e:
-        _logger.debug(f"Failed to parse token usage from output: {e}")
-    return None
+
+def _patch_streaming_method(cls, method_name, wrapper_func):
+    original = getattr(cls, method_name)
+
+    @functools.wraps(original)
+    def patched_method(self, *args, **kwargs):
+        return wrapper_func(original, self, *args, **kwargs)
+
+    patch = _wrap_patch(cls, method_name, patched_method)
+    _store_patch(mlflow.pydantic_ai.FLAVOR_NAME, patch)
+
+
+def _patch_method(cls, method_name):
+    method = getattr(cls, method_name)
+
+    if _is_async_context_manager_factory(method):
+        _patch_streaming_method(cls, method_name, patched_async_stream_call)
+    elif _returns_sync_streamed_result(method):
+        _patch_streaming_method(cls, method_name, patched_sync_stream_call)
+    elif inspect.iscoroutinefunction(method):
+        safe_patch(mlflow.pydantic_ai.FLAVOR_NAME, cls, method_name, patched_async_class_call)
+    else:
+        safe_patch(mlflow.pydantic_ai.FLAVOR_NAME, cls, method_name, patched_class_call)
+
+
+def _get_tool_manager_module_path() -> str:
+    try:
+        import pydantic_ai.tool_manager  # noqa: F401
+
+        return "pydantic_ai.tool_manager"
+    except ImportError:
+        return "pydantic_ai._tool_manager"
+
+
+def _tool_manager_uses_execute_tool_call() -> bool:
+    module_path = mlflow.pydantic_ai._get_tool_manager_module_path()
+    try:
+        module = __import__(module_path, fromlist=["ToolManager"])
+        return hasattr(module.ToolManager, "execute_tool_call")
+    except ImportError:
+        return False
+
+
+def _has_instrumentation_capability() -> bool:
+    try:
+        import pydantic_ai.capabilities.instrumentation  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
+def setup_autologging() -> None:
+    """Install the Pydantic AI 1.x autologging patches."""
+    agent_methods = ["run", "run_sync", "run_stream"]
+
+    try:
+        from pydantic_ai import Agent
+
+        if hasattr(Agent, "run_stream_sync"):
+            agent_methods.append("run_stream_sync")
+    except ImportError:
+        pass
+
+    has_instrumentation_capability = mlflow.pydantic_ai._has_instrumentation_capability()
+    tool_manager_path = f"{mlflow.pydantic_ai._get_tool_manager_module_path()}.ToolManager"
+    class_map = {
+        "pydantic_ai.Agent": agent_methods,
+        tool_manager_path: ["execute_tool_call"]
+        if mlflow.pydantic_ai._tool_manager_uses_execute_tool_call()
+        else ["handle_call"],
+        "pydantic_ai.mcp.MCPServer": ["call_tool", "list_tools"],
+    }
+    if not has_instrumentation_capability:
+        class_map["pydantic_ai.models.instrumented.InstrumentedModel"] = [
+            "request",
+            "request_stream",
+        ]
+
+    try:
+        from pydantic_ai import Tool
+
+        if hasattr(Tool, "run"):
+            class_map["pydantic_ai.Tool"] = ["run"]
+    except ImportError:
+        pass
+
+    try:
+        from pydantic_ai import Agent
+
+        original_init = Agent.__init__
+
+        @functools.wraps(original_init)
+        def patched_init(self, *args, **kwargs):
+            return patched_agent_init(original_init, self, *args, **kwargs)
+
+        patch = _wrap_patch(Agent, "__init__", patched_init)
+        _store_patch(mlflow.pydantic_ai.FLAVOR_NAME, patch)
+    except (ImportError, AttributeError) as e:
+        _logger.error("Error patching Agent.__init__: %s", e)
+
+    for cls_path, methods in class_map.items():
+        module_name, class_name = cls_path.rsplit(".", 1)
+        try:
+            module = __import__(module_name, fromlist=[class_name])
+            cls = getattr(module, class_name)
+        except (ImportError, AttributeError) as e:
+            _logger.error("Error importing %s: %s", cls_path, e)
+            continue
+
+        for method in methods:
+            try:
+                _patch_method(cls, method)
+            except AttributeError as e:
+                _logger.error("Error patching %s.%s: %s", cls_path, method, e)
+
+    if has_instrumentation_capability:
+        try:
+            from pydantic_ai.capabilities.instrumentation import Instrumentation
+
+            safe_patch(
+                mlflow.pydantic_ai.FLAVOR_NAME,
+                Instrumentation,
+                "wrap_model_request",
+                patched_capability_model_request,
+            )
+        except (ImportError, AttributeError) as e:
+            _logger.error("Error patching Instrumentation.wrap_model_request: %s", e)
