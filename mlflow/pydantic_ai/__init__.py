@@ -149,6 +149,15 @@ def autolog(log_traces: bool = True, disable: bool = False, silent: bool = False
     has_instrumentation_capability = _has_instrumentation_capability()
 
     tool_manager_path = f"{_get_tool_manager_module_path()}.ToolManager"
+    try:
+        from pydantic_ai.mcp import MCPServer  # noqa: F401
+
+        mcp_path = "pydantic_ai.mcp.MCPServer"
+        mcp_methods = ["call_tool", "list_tools"]
+    except ImportError:
+        mcp_path = "pydantic_ai.mcp.MCPToolset"
+        mcp_methods = ["call_tool", "get_tools"]
+
     class_map = {
         "pydantic_ai.Agent": agent_methods,
         # In pydantic-ai >= 1.63.0, _agent_graph calls execute_tool_call directly,
@@ -157,7 +166,7 @@ def autolog(log_traces: bool = True, disable: bool = False, silent: bool = False
         tool_manager_path: ["execute_tool_call"]
         if _tool_manager_uses_execute_tool_call()
         else ["handle_call"],
-        "pydantic_ai.mcp.MCPServer": ["call_tool", "list_tools"],
+        mcp_path: mcp_methods,
     }
     if not has_instrumentation_capability:
         class_map["pydantic_ai.models.instrumented.InstrumentedModel"] = [

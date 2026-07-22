@@ -75,7 +75,10 @@ def _extract_safe_attributes(instance: Any) -> dict[str, Any]:
 def _set_span_attributes(span: LiveSpan, instance):
     # 1) MCPServer attributes
     try:
-        from pydantic_ai.mcp import MCPServer
+        try:
+            from pydantic_ai.mcp import MCPServer
+        except ImportError:
+            from pydantic_ai.mcp import MCPToolset as MCPServer
 
         if isinstance(instance, MCPServer):
             mcp_attrs = _get_mcp_server_attributes(instance)
@@ -131,9 +134,14 @@ def _set_span_attributes(span: LiveSpan, instance):
 
 def patched_agent_init(original, self, *args, **kwargs):
     cfg = AutoLoggingConfig.init(flavor_name=mlflow.pydantic_ai.FLAVOR_NAME)
-    if cfg.log_traces and kwargs.get("instrument") is None:
+    supports_instrument_arg = "instrument" in inspect.signature(original).parameters
+    if cfg.log_traces and supports_instrument_arg and kwargs.get("instrument") is None:
         kwargs["instrument"] = True
-    return original(self, *args, **kwargs)
+    result = original(self, *args, **kwargs)
+    # pydantic-ai 2.x removed the constructor argument but retained the property.
+    if cfg.log_traces and not supports_instrument_arg and self.instrument is None:
+        self.instrument = True
+    return result
 
 
 async def patched_async_class_call(original, self, *args, **kwargs):
@@ -295,29 +303,50 @@ class _StreamedRunResultSyncWrapper:
         self._result = result
         self._span = span
         self._finalized = False
+        self._closed = False
 
     def _use_span_context(self):
         return with_active_span(self._span)
 
-    def _finalize(self):
+    def _close_result(self, exc_type=None, exc_val=None, exc_tb=None):
+        if self._closed or not hasattr(self._result, "__exit__"):
+            return None
+        self._closed = True
+        with self._use_span_context():
+            return self._result.__exit__(exc_type, exc_val, exc_tb)
+
+    def _finalize(self, exc_type=None, exc_val=None, exc_tb=None):
         if self._finalized:
             return
         self._finalized = True
-
-        # End child spans that haven't been ended yet.
-        # This is necessary because pydantic_ai's run_stream_sync uses an async generator
-        # that pauses mid-execution, causing async context managers (and their spans) to
-        # never properly exit. We manually end these spans before ending the root span.
-        self._end_unfinished_child_spans()
+        has_error = exc_type is not None
 
         try:
-            self._span.set_outputs(_serialize_output(self._result))
-            if usage_dict := _parse_usage(self._result):
-                self._span.set_attribute(SpanAttributeKey.CHAT_USAGE, usage_dict)
-        except Exception as e:
-            _logger.debug(f"Failed to set streaming outputs: {e}")
+            # pydantic-ai 2.x returns a context manager from run_stream_sync. Close it before
+            # ending MLflow spans so the underlying async generator and its LLM span can finish.
+            suppress_exception = self._close_result(exc_type, exc_val, exc_tb)
+
+            # End child spans that haven't been ended yet.
+            # This is necessary because pydantic_ai's run_stream_sync uses an async generator
+            # that pauses mid-execution, causing async context managers (and their spans) to
+            # never properly exit. We manually end these spans before ending the root span.
+            self._end_unfinished_child_spans()
+
+            try:
+                self._span.set_outputs(_serialize_output(self._result))
+                if usage_dict := _parse_usage(self._result):
+                    self._span.set_attribute(SpanAttributeKey.CHAT_USAGE, usage_dict)
+            except Exception as e:
+                _logger.debug(f"Failed to set streaming outputs: {e}")
+            return suppress_exception
+        except Exception:
+            has_error = True
+            raise
         finally:
-            self._span.end()
+            if has_error:
+                self._span.end(status="ERROR")
+            else:
+                self._span.end()
 
     def _end_unfinished_child_spans(self):
         from mlflow.tracing.trace_manager import InMemoryTraceManager
@@ -367,6 +396,14 @@ class _StreamedRunResultSyncWrapper:
             finally:
                 self._finalize()
 
+    def __enter__(self):
+        if hasattr(self._result, "__enter__"):
+            self._result.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        return self._finalize(exc_type, exc_val, exc_tb)
+
     def __getattr__(self, name):
         return getattr(self._result, name)
 
@@ -410,10 +447,14 @@ def patched_sync_stream_call(original, self, *args, **kwargs):
 def _get_span_type(instance) -> str:
     try:
         from pydantic_ai import Agent, Tool
-        from pydantic_ai.mcp import MCPServer
         from pydantic_ai.models import Model
     except ImportError:
         return SpanType.UNKNOWN
+
+    try:
+        from pydantic_ai.mcp import MCPServer
+    except ImportError:
+        from pydantic_ai.mcp import MCPToolset as MCPServer
 
     # `Model` covers both `InstrumentedModel` (used on pydantic-ai < 1.95) and the
     # concrete provider models (e.g. `OpenAIChatModel`) invoked on the capabilities-era
