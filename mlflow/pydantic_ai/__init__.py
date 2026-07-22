@@ -183,7 +183,7 @@ def autolog(log_traces: bool = True, disable: bool = False, silent: bool = False
         mcp_methods = ["call_tool", "list_tools"]
     except ImportError:
         mcp_path = "pydantic_ai.mcp.MCPToolset"
-        mcp_methods = ["call_tool", "get_tools"]
+        mcp_methods = ["direct_call_tool", "list_tools"]
 
     class_map = {
         "pydantic_ai.Agent": agent_methods,

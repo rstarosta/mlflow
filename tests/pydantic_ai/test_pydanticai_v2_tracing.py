@@ -103,20 +103,47 @@ def test_tool_call_creates_tool_span():
 
 
 @pytest.mark.asyncio
-async def test_mcp_toolset_get_tools_creates_tool_span():
-    async def get_tools(self, ctx):
-        return {}
+async def test_mcp_toolset_list_tools_creates_tool_span():
+    async def list_tools(self):
+        return []
 
-    with patch.object(MCPToolset, "get_tools", new=get_tools):
+    with patch.object(MCPToolset, "list_tools", new=list_tools):
         mlflow.pydantic_ai.autolog(log_traces=True)
         toolset = MCPToolset("http://localhost:8000/mcp")
-        assert await toolset.get_tools(None) == {}
+        assert await toolset.list_tools() == []
 
     traces = get_traces()
     assert len(traces) == 1
-    span = _span_by_name(traces[0].data.spans, "MCPToolset.get_tools")
+    span = _span_by_name(traces[0].data.spans, "MCPToolset.list_tools")
     assert span.span_type == SpanType.TOOL
     assert _get_span_type(toolset) == SpanType.TOOL
+
+
+@pytest.mark.asyncio
+async def test_mcp_toolset_direct_call_tool_creates_tool_span():
+    async def direct_call_tool(self, name, args, *, metadata=None, use_task=False):
+        return {"name": name, "args": args, "metadata": metadata, "use_task": use_task}
+
+    with patch.object(MCPToolset, "direct_call_tool", new=direct_call_tool):
+        mlflow.pydantic_ai.autolog(log_traces=True)
+        toolset = MCPToolset("http://localhost:8000/mcp")
+        result = await toolset.direct_call_tool(
+            "double",
+            {"value": 2},
+            metadata={"source": "test"},
+            use_task=True,
+        )
+
+    assert result == {
+        "name": "double",
+        "args": {"value": 2},
+        "metadata": {"source": "test"},
+        "use_task": True,
+    }
+    traces = get_traces()
+    assert len(traces) == 1
+    span = _span_by_name(traces[0].data.spans, "MCPToolset.direct_call_tool")
+    assert span.span_type == SpanType.TOOL
 
 
 @pytest.mark.asyncio
